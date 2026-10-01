@@ -217,19 +217,29 @@ def verify_claim_with_gemini(arg1: str = "", arg2: str = None, api_key: str = No
     """
     global _WORKING_GEMINI_MODEL
 
-    # Disambiguate arguments
     raw_text = text
     raw_key = api_key
 
-    if raw_text is None and raw_key is None:
+    # Resolve text and key across positional and keyword arguments
+    if raw_text is None:
         if arg2 is not None:
             # Two positional arguments: determine which is key and which is text
-            if is_valid_api_key_format(arg1) and (len(arg2) > 60 or " " in arg2):
-                raw_key, raw_text = arg1, arg2
+            if is_valid_api_key_format(arg1) and (len(arg2) > 50 or " " in arg2):
+                raw_key = raw_key or arg1
+                raw_text = arg2
             else:
-                raw_text, raw_key = arg1, arg2
+                raw_text = arg1
+                raw_key = raw_key or arg2
         else:
-            raw_text = arg1
+            # Single positional argument
+            if raw_key is not None:
+                # arg1 is the text when api_key is passed via keyword
+                raw_text = arg1
+            elif is_valid_api_key_format(arg1) and " " not in arg1:
+                raw_key = arg1
+                raw_text = ""
+            else:
+                raw_text = arg1
 
     target_text = (raw_text or "").strip()
     clean_key = get_gemini_api_key(raw_key)

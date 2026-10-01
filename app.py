@@ -1,13 +1,38 @@
 """
-app.py - Clean, Beginner-Friendly & Responsive Fake News Detector
-Built with Streamlit, Scikit-Learn, and TF-IDF.
+app.py - Responsive, Explainable & Hybrid Fake News Detection Web Application
+Built with Python, Streamlit, Scikit-Learn, and Google Gemini AI.
 """
 
 import os
-import re
 import urllib.parse
 import streamlit as st
 import joblib
+
+# Automatically load backend .env environment variables if present
+try:
+    # pyrefly: ignore [missing-import]
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    env_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
+    if os.path.exists(env_file):
+        with open(env_file, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if line and not line.startswith("#") and "=" in line:
+                    k, v = line.split("=", 1)
+                    k, v = k.strip(), v.strip().strip("'\"")
+                    if k and k not in os.environ:
+                        os.environ[k] = v
+
+from detector import (
+    analyze_text,
+    verify_claim_with_gemini,
+    is_valid_api_key_format,
+    get_gemini_api_key,
+    parse_gemini_verdict
+)
+from scraper import extract_article
 
 # ---------------------------------------------------------
 # Page Setup
@@ -24,16 +49,27 @@ st.set_page_config(
 # ---------------------------------------------------------
 st.markdown("""
 <style>
-    /* Responsive fonts and padding */
+    /* Hide Streamlit sidebar and its toggle button */
+    [data-testid="stSidebar"], section[data-testid="stSidebar"] {
+        display: none !important;
+    }
+    [data-testid="collapsedControl"] {
+        display: none !important;
+    }
+    button[data-testid="stSidebarCollapseButton"] {
+        display: none !important;
+    }
+
+    /* Responsive fonts and typography */
     html, body, [class*="css"] {
         font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
     }
 
     /* Main container max width and padding */
     .block-container {
-        max-width: 820px !important;
+        max-width: 840px !important;
         padding-top: 1.8rem !important;
-        padding-bottom: 2.5rem !important;
+        padding-bottom: 2.8rem !important;
         padding-left: 1.2rem !important;
         padding-right: 1.2rem !important;
     }
@@ -41,24 +77,28 @@ st.markdown("""
     /* Header styling */
     .app-header {
         text-align: center;
-        padding: 20px 16px;
-        background: linear-gradient(135deg, rgba(30, 41, 59, 0.7) 0%, rgba(15, 23, 42, 0.9) 100%);
+        padding: 24px 18px;
+        background: linear-gradient(135deg, rgba(30, 41, 59, 0.75) 0%, rgba(15, 23, 42, 0.95) 100%);
         border: 1px solid rgba(255, 255, 255, 0.1);
         border-radius: 14px;
-        margin-bottom: 22px;
+        margin-bottom: 24px;
+        box-shadow: 0 4px 20px rgba(0, 0, 0, 0.25);
     }
 
     .app-title {
-        font-size: 1.9rem;
+        font-size: 1.95rem;
         font-weight: 700;
         color: #F8FAFC;
         margin-bottom: 6px;
+        letter-spacing: -0.02em;
     }
 
     .app-subtitle {
         font-size: 0.95rem;
         color: #94A3B8;
-        line-height: 1.4;
+        line-height: 1.45;
+        max-width: 620px;
+        margin: 0 auto;
     }
 
     /* Result Card Styles */
@@ -66,7 +106,7 @@ st.markdown("""
         background: rgba(16, 185, 129, 0.12);
         border: 1.5px solid #10B981;
         border-radius: 12px;
-        padding: 18px 20px;
+        padding: 20px 22px;
         margin-top: 18px;
         margin-bottom: 18px;
         text-align: center;
@@ -76,28 +116,45 @@ st.markdown("""
         background: rgba(239, 68, 68, 0.12);
         border: 1.5px solid #EF4444;
         border-radius: 12px;
-        padding: 18px 20px;
+        padding: 20px 22px;
+        margin-top: 18px;
+        margin-bottom: 18px;
+        text-align: center;
+    }
+
+    .result-card-mixed {
+        background: rgba(234, 179, 8, 0.12);
+        border: 1.5px solid #EAB308;
+        border-radius: 12px;
+        padding: 20px 22px;
         margin-top: 18px;
         margin-bottom: 18px;
         text-align: center;
     }
 
     .result-title-real {
-        font-size: 1.6rem;
+        font-size: 1.65rem;
         font-weight: 800;
         color: #34D399;
         margin-bottom: 4px;
     }
 
     .result-title-fake {
-        font-size: 1.6rem;
+        font-size: 1.65rem;
         font-weight: 800;
         color: #F87171;
         margin-bottom: 4px;
     }
 
+    .result-title-mixed {
+        font-size: 1.65rem;
+        font-weight: 800;
+        color: #FACC15;
+        margin-bottom: 4px;
+    }
+
     .confidence-text {
-        font-size: 1rem;
+        font-size: 1.02rem;
         color: #E2E8F0;
         font-weight: 500;
     }
@@ -127,6 +184,35 @@ st.markdown("""
         font-weight: 500;
     }
 
+    /* Gemini AI Card */
+    .gemini-card {
+        background: linear-gradient(135deg, rgba(99, 102, 241, 0.12) 0%, rgba(168, 85, 247, 0.12) 100%);
+        border: 1px solid rgba(168, 85, 247, 0.35);
+        border-radius: 12px;
+        padding: 20px 22px;
+        margin-top: 16px;
+        margin-bottom: 16px;
+    }
+
+    .gemini-title {
+        font-size: 1.15rem;
+        font-weight: 700;
+        background: linear-gradient(135deg, #818CF8 0%, #C084FC 100%);
+        -webkit-background-clip: text;
+        -webkit-text-fill-color: transparent;
+        margin-bottom: 8px;
+    }
+
+    .highlight-container {
+        background: rgba(15, 23, 42, 0.6);
+        border: 1px solid rgba(255, 255, 255, 0.08);
+        border-radius: 8px;
+        padding: 16px;
+        line-height: 1.8;
+        font-size: 0.95rem;
+        color: #E2E8F0;
+    }
+
     /* Responsive Mobile Adjustments */
     @media (max-width: 640px) {
         .app-title {
@@ -135,7 +221,7 @@ st.markdown("""
         .app-subtitle {
             font-size: 0.85rem;
         }
-        .result-title-real, .result-title-fake {
+        .result-title-real, .result-title-fake, .result-title-mixed {
             font-size: 1.3rem;
         }
         .block-container {
@@ -155,11 +241,9 @@ def load_ml_components():
     base_dir = os.path.dirname(os.path.abspath(__file__))
     model_path = os.path.join(base_dir, "fake_news_model.pkl")
     tfidf_path = os.path.join(base_dir, "tfidf_vectorizer.pkl")
-    
     model = joblib.load(model_path)
     tfidf = joblib.load(tfidf_path)
     return model, tfidf
-
 
 try:
     model, tfidf = load_ml_components()
@@ -169,117 +253,39 @@ except Exception as e:
 
 
 # ---------------------------------------------------------
-# Simple Helper Functions (Easy to explain in an interview)
+# UI Header
 # ---------------------------------------------------------
-def clean_input_text(text: str) -> str:
-    """Preprocesses input text by lowercasing and removing extra spaces."""
-    if not text:
-        return ""
-    text = text.lower()
-    text = re.sub(r"\s+", " ", text).strip()
-    return text
-
-
-def fetch_text_from_url(url: str):
-    """Simple scraper to fetch article text from a web link."""
-    try:
-        import requests
-        from bs4 import BeautifulSoup
-
-        if not url.startswith("http://") and not url.startswith("https://"):
-            url = "https://" + url
-
-        headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
-        resp = requests.get(url, headers=headers, timeout=8)
-        resp.raise_for_status()
-
-        soup = BeautifulSoup(resp.content, "html.parser")
-        for tag in soup(["script", "style", "nav", "footer", "header", "aside"]):
-            tag.decompose()
-
-        # Get main paragraphs
-        paragraphs = [p.get_text().strip() for p in soup.find_all("p") if len(p.get_text().strip()) > 35]
-        if not paragraphs:
-            return None, "Could not find article paragraphs on this page."
-        
-        full_text = "\n\n".join(paragraphs[:10])
-        return full_text, None
-    except Exception as e:
-        return None, f"Could not load URL: {str(e)}"
-
-
-def predict_news(text: str):
-    """
-    Predicts if news is Real or Fake and finds the top influential words.
-    - Class 1 = Real News
-    - Class 0 = Fake News
-    """
-    cleaned = clean_input_text(text)
-    vector = tfidf.transform([cleaned])
-
-    # Model prediction
-    pred = model.predict(vector)[0]
-    probs = model.predict_proba(vector)[0]
-
-    prob_fake = probs[0] * 100
-    prob_real = probs[1] * 100
-
-    if pred == 1:
-        label = "REAL NEWS"
-        confidence = prob_real
-        is_real = True
-    else:
-        label = "FAKE NEWS"
-        confidence = prob_fake
-        is_real = False
-
-    # Extract word influence (Attribution: TF-IDF value * Model Weight)
-    coef = model.coef_[0]
-    feature_names = tfidf.get_feature_names_out()
-    nonzeros = vector.nonzero()[1]
-
-    word_scores = []
-    for idx in nonzeros:
-        word = feature_names[idx]
-        score = vector[0, idx] * coef[idx]
-        word_scores.append((word, score))
-
-    # Top words pointing to Real (positive score) and Fake (negative score)
-    real_words = [w for w, s in sorted(word_scores, key=lambda x: x[1], reverse=True) if s > 0][:6]
-    fake_words = [w for w, s in sorted(word_scores, key=lambda x: x[1]) if s < 0][:6]
-
-    # Simple sensationalism check (exclamation marks, all caps)
-    exclamations = text.count("!")
-    caps_words = [w for w in text.split() if w.isupper() and len(w) > 2 and w.isalpha()]
-    
-    return {
-        "label": label,
-        "is_real": is_real,
-        "confidence": confidence,
-        "prob_real": prob_real,
-        "prob_fake": prob_fake,
-        "real_words": real_words,
-        "fake_words": fake_words,
-        "exclamations": exclamations,
-        "caps_count": len(caps_words)
-    }
-
-
-# ---------------------------------------------------------
-# User Interface
-# ---------------------------------------------------------
-
-# Header Banner
 st.markdown("""
 <div class="app-header">
     <div class="app-title">📰 Fake News Detection System</div>
     <div class="app-subtitle">
-        Enter a news article or web link to check whether it is authentic or fabricated using Machine Learning.
+        Enter a news article or web link to check whether it is authentic or fabricated using NLP Machine Learning and AI Fact-Checking.
     </div>
 </div>
 """, unsafe_allow_html=True)
 
-# Preset examples for fast testing
+
+# ---------------------------------------------------------
+# Gemini AI Configuration (Environment or Direct UI Input)
+# ---------------------------------------------------------
+env_gemini_key = get_gemini_api_key()
+with st.expander("✨ Gemini AI Fact-Checking Settings (Optional)", expanded=False):
+    if env_gemini_key and is_valid_api_key_format(env_gemini_key):
+        st.success("✅ Gemini API Key detected from environment (.env). AI Fact-Checking is active!")
+        custom_key = st.text_input("Override Gemini API Key (optional):", type="password", placeholder="Leave blank to use .env key")
+        active_gemini_key = custom_key.strip() if custom_key.strip() else env_gemini_key
+    else:
+        st.info("ℹ️ To enable AI-powered semantic claim verification, enter a free Gemini API key below (or set GEMINI_API_KEY in `.env`).")
+        custom_key = st.text_input("Enter Google Gemini API Key:", type="password", placeholder="Paste your API key here (AIza...)")
+        active_gemini_key = custom_key.strip()
+        st.caption("Get a free API key at [Google AI Studio](https://aistudio.google.com/). The local ML model works offline without a key.")
+
+is_gemini_active = bool(active_gemini_key and is_valid_api_key_format(active_gemini_key))
+
+
+# ---------------------------------------------------------
+# Preset Test Examples
+# ---------------------------------------------------------
 EXAMPLE_REAL = (
     "WASHINGTON (Reuters) - The Federal Reserve held interest rates steady on Wednesday, "
     "stating that inflation has continued to ease over the past year while economic activity "
@@ -292,7 +298,6 @@ EXAMPLE_FAKE = (
     "Share this urgent video before it gets deleted everywhere!!"
 )
 
-# Interactive Preset Buttons
 st.markdown("**Quick Examples to Try:**")
 col_ex1, col_ex2, col_ex3 = st.columns([1, 1, 1])
 
@@ -314,23 +319,33 @@ with col_ex3:
         st.session_state["news_text"] = ""
         st.rerun()
 
-# Optional URL input
+
+# ---------------------------------------------------------
+# Optional Web URL Scraper
+# ---------------------------------------------------------
 with st.expander("🔗 Or fetch article directly from a Web URL"):
     url_input = st.text_input("Enter Article URL:", placeholder="https://example.com/news-story")
     if st.button("Fetch Article Content"):
         if url_input.strip():
-            with st.spinner("Fetching article from website..."):
-                scraped_text, err = fetch_text_from_url(url_input.strip())
-                if err:
-                    st.error(err)
+            with st.spinner("Extracting article content from website..."):
+                article_data = extract_article(url_input.strip())
+                if not article_data.get("success"):
+                    st.error(article_data.get("error", "Failed to fetch article."))
                 else:
-                    st.session_state["news_text"] = scraped_text
-                    st.success("Article loaded successfully!")
+                    text_content = article_data.get("text", "")
+                    title = article_data.get("title", "")
+                    combined_text = f"{title}\n\n{text_content}".strip() if title else text_content
+                    st.session_state["news_text"] = combined_text
+                    domain_msg = f" from **{article_data.get('domain')}**" if article_data.get('domain') else ""
+                    st.success(f"Article loaded{domain_msg} ({article_data.get('word_count', 0)} words)!")
                     st.rerun()
         else:
             st.warning("Please enter a valid URL.")
 
-# Text Area for Input
+
+# ---------------------------------------------------------
+# News Article Input & Analysis
+# ---------------------------------------------------------
 user_input = st.text_area(
     "News Article Text:",
     value=st.session_state["news_text"],
@@ -338,35 +353,44 @@ user_input = st.text_area(
     placeholder="Paste news headline or paragraph here to analyze..."
 )
 
-# Analyze Button
 if st.button("⚡ Analyze News Article", type="primary", use_container_width=True):
     if not user_input.strip():
         st.warning("Please paste or type a news article first.")
     else:
-        with st.spinner("Analyzing text patterns with Machine Learning..."):
-            res = predict_news(user_input)
+        with st.spinner("Analyzing linguistic patterns with Machine Learning..."):
+            res = analyze_text(user_input)
 
-            # Result Banner
-            if res["is_real"]:
+            # Prediction Card
+            label = res["prediction"]
+            if label == "REAL NEWS":
                 st.markdown(f"""
                 <div class="result-card-real">
                     <div class="result-title-real">✅ LIKELY REAL NEWS</div>
                     <div class="confidence-text">
-                        Model Confidence: <strong>{res['confidence']:.1f}%</strong>
+                        Credibility Score: <strong>{res['credibility_score']:.1f}%</strong> (Model Confidence: {res['confidence']:.1f}%)
+                    </div>
+                </div>
+                """, unsafe_allow_html=True)
+            elif label == "FAKE NEWS":
+                st.markdown(f"""
+                <div class="result-card-fake">
+                    <div class="result-title-fake">❌ LIKELY FAKE NEWS</div>
+                    <div class="confidence-text">
+                        Suspicion Confidence: <strong>{res['confidence']:.1f}%</strong> (Credibility Score: {res['credibility_score']:.1f}%)
                     </div>
                 </div>
                 """, unsafe_allow_html=True)
             else:
                 st.markdown(f"""
-                <div class="result-card-fake">
-                    <div class="result-title-fake">❌ LIKELY FAKE NEWS</div>
+                <div class="result-card-mixed">
+                    <div class="result-title-mixed">⚠️ UNVERIFIED / MIXED SIGNALS</div>
                     <div class="confidence-text">
-                        Model Confidence: <strong>{res['confidence']:.1f}%</strong>
+                        Credibility Score: <strong>{res['credibility_score']:.1f}%</strong>
                     </div>
                 </div>
                 """, unsafe_allow_html=True)
 
-            # Confidence Progress Bar
+            # Probability Breakdown Bars
             col_bar1, col_bar2 = st.columns([1, 1])
             with col_bar1:
                 st.caption(f"Real Probability: **{res['prob_real']:.1f}%**")
@@ -375,33 +399,55 @@ if st.button("⚡ Analyze News Article", type="primary", use_container_width=Tru
                 st.caption(f"Fake Probability: **{res['prob_fake']:.1f}%**")
                 st.progress(res["prob_fake"] / 100.0)
 
-            # Key Word Signals (Beginner-Friendly Explanation)
+            # Influential Keyword Signals
             st.markdown("#### 🔍 Why did the model make this decision?")
             col_w1, col_w2 = st.columns(2)
 
             with col_w1:
                 st.markdown("**🟢 Words pointing to Real News:**")
-                if res["real_words"]:
-                    tags_html = "".join([f'<span class="tag-real">{w}</span>' for w in res["real_words"]])
+                if res["top_real_words"]:
+                    tags_html = "".join([f'<span class="tag-real">{w["token"]}</span>' for w in res["top_real_words"][:8]])
                     st.markdown(tags_html, unsafe_allow_html=True)
                 else:
                     st.write("*No strong real indicator words found.*")
 
             with col_w2:
                 st.markdown("**🔴 Words pointing to Fake News:**")
-                if res["fake_words"]:
-                    tags_html = "".join([f'<span class="tag-fake">{w}</span>' for w in res["fake_words"]])
+                if res["top_fake_words"]:
+                    tags_html = "".join([f'<span class="tag-fake">{w["token"]}</span>' for w in res["top_fake_words"][:8]])
                     st.markdown(tags_html, unsafe_allow_html=True)
                 else:
                     st.write("*No strong fake indicator words found.*")
 
-            # Sensationalism notice if any
-            if res["exclamations"] > 2 or res["caps_count"] > 1:
-                st.info(f"⚠️ **Sensationalism Alert**: Found {res['exclamations']} exclamation marks and {res['caps_count']} ALL-CAPS words. Real news articles typically use neutral, objective punctuation.")
+            # Word-level highlight preview
+            if res.get("highlighted_html"):
+                with st.expander("📝 View Interactive Word-Level Highlighting"):
+                    st.markdown(
+                        f'<div class="highlight-container">{res["highlighted_html"]}</div>',
+                        unsafe_allow_html=True
+                    )
+                    st.caption("🟢 Green highlights indicate words associated with authentic reporting. 🔴 Red highlights indicate words associated with fabricated/sensational reporting.")
 
-            # Instant Fact-Check Links
+            # Stylometric or Sensationalism Alerts
+            sty = res.get("stylometrics", {})
+            if sty.get("sensationalism_score", 0) > 30 or sty.get("exclamation_count", 0) > 2 or sty.get("all_caps_count", 0) > 1:
+                alerts = []
+                if sty.get("exclamation_count", 0) > 1:
+                    alerts.append(f"{sty['exclamation_count']} exclamation marks")
+                if sty.get("all_caps_count", 0) > 1:
+                    alerts.append(f"{sty['all_caps_count']} ALL-CAPS words")
+                if sty.get("clickbait_hits"):
+                    alerts.append(f"clickbait triggers ({', '.join(sty['clickbait_hits'][:3])})")
+                details = ", ".join(alerts) if alerts else "sensational language"
+                st.warning(f"⚠️ **Sensationalism Alert**: Detected {details}. Real journalistic news typically maintains neutral, objective tone and standard punctuation.")
+
+            # Model Bias Notice
+            if res.get("bias_warning"):
+                st.info(f"ℹ️ **Linguistic Note**: {res['bias_warning']}")
+
+            # Fact-Check Search Links
             st.markdown("---")
-            st.markdown("#### 🌐 Verify with Trusted Fact-Checkers")
+            st.markdown("#### 🌐 Verify with Established Fact-Checkers")
             query = urllib.parse.quote(user_input[:80])
             col_fc1, col_fc2 = st.columns(2)
             with col_fc1:
@@ -409,9 +455,55 @@ if st.button("⚡ Analyze News Article", type="primary", use_container_width=Tru
             with col_fc2:
                 st.link_button("🔎 Search on Snopes.com", f"https://www.snopes.com/search/{query}/", use_container_width=True)
 
+            # Gemini AI Real-World Semantic Fact-Check
+            if is_gemini_active:
+                st.markdown("---")
+                st.markdown("#### ✨ Gemini AI Semantic Fact-Check")
+                with st.spinner("Consulting Gemini AI for real-world factual correctness..."):
+                    ai_verdict, ai_err = verify_claim_with_gemini(user_input, api_key=active_gemini_key)
+                    if ai_verdict:
+                        verdict_tag, explanation = parse_gemini_verdict(ai_verdict)
+                        v_lower = verdict_tag.lower()
+                        if "fake" in v_lower:
+                            badge_bg = "rgba(239, 68, 68, 0.2)"
+                            badge_border = "rgba(239, 68, 68, 0.5)"
+                            badge_color = "#F87171"
+                            badge_icon = "🔴"
+                        elif "real" in v_lower:
+                            badge_bg = "rgba(34, 197, 94, 0.2)"
+                            badge_border = "rgba(34, 197, 94, 0.5)"
+                            badge_color = "#4ADE80"
+                            badge_icon = "🟢"
+                        else:
+                            badge_bg = "rgba(234, 179, 8, 0.2)"
+                            badge_border = "rgba(234, 179, 8, 0.5)"
+                            badge_color = "#FACC15"
+                            badge_icon = "🟡"
+
+                        st.markdown(f"""
+                        <div class="gemini-card">
+                            <div style="display: flex; align-items: center; justify-content: space-between; margin-bottom: 12px; flex-wrap: wrap; gap: 8px;">
+                                <div class="gemini-title" style="margin-bottom: 0;">🤖 Gemini AI Fact-Check</div>
+                                <span style="background: {badge_bg}; border: 1px solid {badge_border}; color: {badge_color}; font-weight: 700; padding: 4px 14px; border-radius: 9999px; font-size: 0.88rem; letter-spacing: 0.03em;">
+                                    {badge_icon} {verdict_tag.upper()}
+                                </span>
+                            </div>
+                            <div style="color: #94A3B8; font-size: 0.85rem; font-weight: 600; text-transform: uppercase; letter-spacing: 0.05em; margin-bottom: 6px;">
+                                Factual Correctness Summary:
+                            </div>
+                            <div style="color: #F1F5F9; line-height: 1.65; font-size: 0.98rem; font-weight: 400;">
+                                {explanation}
+                            </div>
+                        </div>
+                        """, unsafe_allow_html=True)
+                    else:
+                        st.warning(f"⚠️ AI Verification Notice: {ai_err}")
+            else:
+                st.caption("💡 *Tip: Configure your Gemini API key in the '✨ Gemini AI Fact-Checking Settings' expander above or in `.env` to enable instant AI real-world fact checking.*")
+
 
 # ---------------------------------------------------------
-# Educational & Explanatory Accordions (Great for Project Viva/Presentation)
+# Educational & Explanatory Accordions (Viva / Presentation)
 # ---------------------------------------------------------
 st.markdown("---")
 
@@ -424,6 +516,10 @@ with st.expander("💡 How does this project work? (Easy Explanation)"):
        Converts words into numbers. Words that appear frequently in fake news (or real news) get special numerical weights.
     3. **Logistic Regression Classifier**: 
        A binary classification model trained on thousands of labeled news articles. It calculates whether the combination of words in the article leans closer to **Real (1)** or **Fake (0)**.
+    4. **Debiased Credibility Scoring**:
+       Evaluates stylometrics (sensationalism, punctuation, clickbait triggers) to avoid false positives on neutral facts.
+    5. **Hybrid AI Verification**:
+       Leverages Google Gemini LLM to cross-verify claims against real-world knowledge.
     """)
 
 with st.expander("🛡️ 4 Quick Tips to Spot Fake News Yourself"):
@@ -433,3 +529,10 @@ with st.expander("🛡️ 4 Quick Tips to Spot Fake News Yourself"):
     - **3. Check the Author & Date**: Are there real author credentials? Is an old story being shared as current?
     - **4. Cross-Verify**: If breaking news is genuine, multiple major media outlets will be reporting on it simultaneously.
     """)
+
+# Footer
+st.markdown("""
+<div style="text-align: center; color: #64748B; font-size: 0.85rem; margin-top: 36px; padding-top: 18px; border-top: 1px solid rgba(255, 255, 255, 0.08);">
+    Fake News Detection System • Built with Python, Streamlit, Scikit-Learn & Google Gemini AI • MIT License
+</div>
+""", unsafe_allow_html=True)

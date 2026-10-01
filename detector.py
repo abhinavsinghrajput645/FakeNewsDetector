@@ -7,11 +7,31 @@ import os
 import re
 import html
 import joblib
+import requests
 import numpy as np
 
-# Cache instances
+# Load backend environment variables from .env if present
+try:
+    # pyrefly: ignore [missing-import]
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    env_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
+    if os.path.exists(env_file):
+        with open(env_file, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if line and not line.startswith("#") and "=" in line:
+                    k, v = line.split("=", 1)
+                    k, v = k.strip(), v.strip().strip("'\"")
+                    if k and k not in os.environ:
+                        os.environ[k] = v
+
+# Cached model and Gemini states
 _MODEL = None
 _TFIDF = None
+_WORKING_GEMINI_MODEL = None
+
 
 # Curated list of sensationalist / clickbait triggers
 CLICKBAIT_TRIGGERS = {
@@ -133,13 +153,204 @@ def compute_stylometrics(text: str) -> dict:
     }
 
 
-def analyze_text(text: str, model_path="fake_news_model.pkl", tfidf_path="tfidf_vectorizer.pkl") -> dict:
+
+def is_valid_api_key_format(key: str) -> bool:
+    """Validates Gemini API keys (supports traditional AIza... and newer formats)."""
+    if not key:
+        return False
+    clean = key.encode("ascii", "ignore").decode("ascii").strip()
+    if " " in clean or len(clean) < 20:
+        return False
+    return bool(re.match(r"^[A-Za-z0-9_.-]{20,}$", clean))
+
+
+def get_gemini_api_key(explicit_key: str = None) -> str:
+    """Returns valid API key from explicit argument or GEMINI_API_KEY environment variable."""
+    key = explicit_key or os.environ.get("GEMINI_API_KEY", "")
+    return key.encode("ascii", "ignore").decode("ascii").strip() if key else ""
+
+
+def get_gemini_models_list(api_key: str):
+    """Queries Google API to discover which models are enabled for this API key."""
+    clean_key = api_key.encode("ascii", "ignore").decode("ascii").strip()
+    if not is_valid_api_key_format(clean_key):
+        return None
+
+    headers = {"x-goog-api-key": clean_key, "Content-Type": "application/json"}
+    for version in ["v1beta", "v1"]:
+        try:
+            url = f"https://generativelanguage.googleapis.com/{version}/models?key={clean_key}"
+            r = requests.get(url, headers=headers, timeout=5)
+            if r.status_code == 200:
+                data = r.json()
+                models = [
+                    m["name"].replace("models/", "")
+                    for m in data.get("models", [])
+                    if "generateContent" in m.get("supportedGenerationMethods", [])
+                ]
+                if models:
+                    # Filter for standard text/flash models, excluding audio/image/experimental omni previews
+                    flash_models = [
+                        m for m in models
+                        if "flash" in m.lower()
+                        and not any(x in m.lower() for x in ["tts", "image", "omni", "preview", "customtools"])
+                    ]
+                    # Put gemini-3.8-flash and stable flash models first
+                    priority_order = ["gemini-3.8-flash", "gemini-3.7-flash", "gemini-3.5-flash", "gemini-flash-latest"]
+                    ordered = [m for m in priority_order if m in flash_models]
+                    for m in sorted(flash_models, reverse=True):
+                        if m not in ordered:
+                            ordered.append(m)
+                    chosen = ordered if ordered else models
+                    return [(version, m) for m in chosen]
+        except Exception:
+            continue
+    return None
+
+
+def verify_claim_with_gemini(arg1: str = "", arg2: str = None, api_key: str = None, text: str = None):
+    """
+    LLM Fact-Checking using Google Gemini REST API.
+    Auto-detects active model and falls back through candidate models.
+    Supports verify_claim_with_gemini(text, api_key) or verify_claim_with_gemini(api_key, text).
+    Uses explicit api_key or falls back to GEMINI_API_KEY environment variable.
+    """
+    global _WORKING_GEMINI_MODEL
+
+    # Disambiguate arguments
+    raw_text = text
+    raw_key = api_key
+
+    if raw_text is None and raw_key is None:
+        if arg2 is not None:
+            # Two positional arguments: determine which is key and which is text
+            if is_valid_api_key_format(arg1) and (len(arg2) > 60 or " " in arg2):
+                raw_key, raw_text = arg1, arg2
+            else:
+                raw_text, raw_key = arg1, arg2
+        else:
+            raw_text = arg1
+
+    target_text = (raw_text or "").strip()
+    clean_key = get_gemini_api_key(raw_key)
+
+    if not clean_key:
+        return None, "Gemini API key is missing. Set GEMINI_API_KEY in your .env or backend environment."
+    if not is_valid_api_key_format(clean_key):
+        return None, "Invalid API key format. Please enter a valid Gemini API key from Google AI Studio."
+    if not target_text:
+        return None, "Article text to fact check is empty."
+
+    prompt = (
+        "You are an expert, objective fact-checking assistant. "
+        "Analyze the factual correctness of the following news claim or article snippet:\n\n"
+        f"\"{target_text[:1500]}\"\n\n"
+        "Provide your analysis concisely in exactly this structure:\n"
+        "- **Verdict**: [Real News | Fake News | Unverified]\n"
+        "- **Factual Reality**: Provide 2 to 3 concise, clear sentences explaining whether this news is correct or false, what actually happened, and noting credible sources like Reuters, AP, or international defense authorities."
+    )
+
+    payload = {
+        "contents": [{"parts": [{"text": prompt}]}],
+        "generationConfig": {"temperature": 0.1, "maxOutputTokens": 1024}
+    }
+    headers = {"x-goog-api-key": clean_key, "Content-Type": "application/json"}
+
+    candidates = []
+    if _WORKING_GEMINI_MODEL:
+        candidates.append(_WORKING_GEMINI_MODEL)
+
+    detected_list = get_gemini_models_list(clean_key)
+    if detected_list:
+        for pair in detected_list:
+            if pair not in candidates:
+                candidates.append(pair)
+
+    fallback_models = [
+        ("v1beta", "gemini-3.8-flash"),
+        ("v1", "gemini-3.8-flash"),
+        ("v1beta", "gemini-flash-latest"),
+        ("v1beta", "gemini-3.7-flash"),
+        ("v1beta", "gemini-3.5-flash"),
+        ("v1beta", "gemini-2.5-flash"),
+        ("v1beta", "gemini-pro"),
+    ]
+    for pair in fallback_models:
+        if pair not in candidates:
+            candidates.append(pair)
+
+    last_error = None
+    for version, model_name in candidates:
+        url = f"https://generativelanguage.googleapis.com/{version}/models/{model_name}:generateContent?key={clean_key}"
+        try:
+            resp = requests.post(url, json=payload, headers=headers, timeout=12)
+            if resp.status_code == 200:
+                _WORKING_GEMINI_MODEL = (version, model_name)
+                data = resp.json()
+                text_out = data["candidates"][0]["content"]["parts"][0]["text"]
+                return text_out, None
+            elif resp.status_code == 404:
+                last_error = f"Model {model_name} on {version} returned 404."
+                continue
+            elif resp.status_code == 400:
+                return None, "Invalid API key or malformed request. Please check your Gemini key."
+            elif resp.status_code in [429, 503]:
+                last_error = f"Model {model_name} temporarily unavailable (HTTP {resp.status_code})."
+                continue
+            else:
+                last_error = f"Gemini API returned status code {resp.status_code}."
+        except requests.exceptions.Timeout:
+            last_error = "Connection to Gemini timed out."
+        except Exception as e:
+            last_error = f"Error contacting Gemini API: {str(e)}"
+
+    return None, f"Could not connect to Gemini ({last_error}). Please verify your API key."
+
+
+def parse_gemini_verdict(raw_text: str):
+    """Parses Gemini response into a clean verdict and a 2-3 lines correctness explanation."""
+    if not raw_text:
+        return "Unverified", "No factual assessment provided."
+
+    # Extract verdict
+    v_match = re.search(r"\*?\*?Verdict\*?\*?:\s*([^\n\r]+)", raw_text, re.IGNORECASE)
+    verdict = v_match.group(1).replace("**", "").replace("[", "").replace("]", "").strip() if v_match else "Unverified"
+
+    if "fake" in verdict.lower():
+        verdict = "Fake News"
+    elif "real" in verdict.lower():
+        verdict = "Real News"
+    elif "unverified" in verdict.lower() or "satire" in verdict.lower():
+        verdict = "Unverified / Satire"
+
+    # Extract explanation / factual reality
+    exp_match = re.search(r"\*?\*?(?:Factual Reality|Explanation|Summary)\*?\*?:\s*(.+)", raw_text, re.IGNORECASE | re.DOTALL)
+    if exp_match:
+        explanation = exp_match.group(1).strip()
+    else:
+        # Fallback: remove verdict line and join remaining lines
+        lines = [line.strip() for line in raw_text.splitlines() if line.strip() and not re.search(r"verdict", line, re.IGNORECASE)]
+        explanation = " ".join(lines)
+
+    # Clean leading asterisks or bullet dashes from explanation
+    explanation = re.sub(r"^[-*•\s]+", "", explanation).strip()
+    return verdict, explanation
+
+
+def analyze_text(
+    text: str,
+    model_path="fake_news_model.pkl",
+    tfidf_path="tfidf_vectorizer.pkl",
+    verify_with_gemini: bool = False,
+    gemini_api_key: str = None
+) -> dict:
     """
     Performs comprehensive analysis:
     - ML inference (Real vs Fake probability)
     - Feature-level explainability (word attributions)
     - Stylometric signals
     - Composite Credibility Index
+    - Optional Gemini AI semantic fact-check verification
     """
     model, tfidf = load_models(model_path, tfidf_path)
     
@@ -156,7 +367,8 @@ def analyze_text(text: str, model_path="fake_news_model.pkl", tfidf_path="tfidf_
             "top_fake_words": [],
             "highlighted_html": "",
             "stylometrics": compute_stylometrics(""),
-            "bias_warning": None
+            "bias_warning": None,
+            "gemini_verification": None
         }
 
     stylometrics = compute_stylometrics(text)
@@ -226,10 +438,10 @@ def analyze_text(text: str, model_path="fake_news_model.pkl", tfidf_path="tfidf_
         credibility = model_real_pct - (sensationalism * 0.45)
     else:
         # Model considers it fake. Is it genuinely fake, or neutral text suffering from model bias?
-        if sensationalism < 15 and clickbait_count == 0 and total_fake_pull < 0.6:
+        if sensationalism < 15 and clickbait_count == 0 and (total_fake_pull < 1.0 or sensationalism == 0):
             # Neutral factual text without sensationalism or known fake markers
             # Adjust for the trained model's negative intercept (-1.24) and domain gap
-            neutral_boost = 55.0 - (total_fake_pull * 20.0)
+            neutral_boost = 55.0 - (total_fake_pull * 15.0)
             credibility = max(model_real_pct, neutral_boost)
             if not bias_warning:
                 bias_warning = "Domain Notice: Neutral, non-sensational text without political wire markers. Adjusted for model's wire-service training bias."
@@ -263,6 +475,16 @@ def analyze_text(text: str, model_path="fake_news_model.pkl", tfidf_path="tfidf_
     # Build Explainable HTML Highlighting
     highlighted_html = generate_highlighted_html(text, token_score_map)
 
+    # Optional Gemini verification
+    gemini_result = None
+    if verify_with_gemini:
+        verdict, err = verify_claim_with_gemini(text, api_key=gemini_api_key)
+        gemini_result = {
+            "success": verdict is not None,
+            "verdict": verdict,
+            "error": err
+        }
+
     return {
         "prediction": final_prediction,
         "is_real": is_real,
@@ -275,7 +497,8 @@ def analyze_text(text: str, model_path="fake_news_model.pkl", tfidf_path="tfidf_
         "top_fake_words": top_fake_words,
         "highlighted_html": highlighted_html,
         "stylometrics": stylometrics,
-        "bias_warning": bias_warning
+        "bias_warning": bias_warning,
+        "gemini_verification": gemini_result
     }
 
 
